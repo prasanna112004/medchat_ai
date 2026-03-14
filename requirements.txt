@@ -1,0 +1,10 @@
+streamlit
+langchain-core
+langchain-groq
+faiss-cpu
+numpy
+sentence-transformers
+PyPDF2
+python-docx
+duckduckgo-search
+pdf2image
