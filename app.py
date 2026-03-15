@@ -73,58 +73,77 @@ YOUR ANSWER:"""
 
 def get_response(messages, mode):
     try:
-        query = messages[-1]["content"]
+        raw_query = messages[-1]["content"]
         style = (
             "Be brief and precise (2-3 sentences max)."
             if mode == "Concise"
             else "Be detailed, structured, and use bullet points where helpful."
         )
         source = None
+        retrieved_context = ""
 
         if st.session_state.indexed:
-            docs, sources = retrieve_relevant_docs(query)
+            docs, sources = retrieve_relevant_docs(raw_query)
+
+            if not docs or not sources:
+                if len(messages) > 1:
+                    recent = messages[-5:-1]
+                    history = "\n".join(
+                        [f"{m['role'].upper()}: {m['content']}" for m in recent]
+                    )
+                    contextual_query = f"Conversation so far:\n{history}\n\nFollow-up question: {raw_query}"
+                    docs, sources = retrieve_relevant_docs(contextual_query)
+
             context = "\n\n".join(docs) if docs else ""
 
             if context.strip() and sources:
                 first = sources[0]
                 source_detail = f"{first.get('file', '')} {('p.' + str(first['page'])) if first.get('page') else ''}".strip()
                 st.session_state["last_source_detail"] = source_detail
+                st.session_state["last_score"] = first.get("distance", 0)
 
                 raw = chat_model.invoke(
-                    rag_prompt(context, query, style)
+                    rag_prompt(context, raw_query, style)
                 ).content.strip()
 
                 if "INSUFFICIENT_CONTEXT" in raw.upper():
                     source = "web"
                     response = chat_model.invoke(
-                        web_prompt(web_search(query), query, style)
+                        web_prompt(web_search(raw_query), raw_query, style)
                     ).content
                 else:
                     source = "rag"
                     response = raw
+                    retrieved_context = context
 
             else:
                 source = "web"
                 response = chat_model.invoke(
-                    web_prompt(web_search(query), query, style)
+                    web_prompt(web_search(raw_query), raw_query, style)
                 ).content
 
         else:
             source = "web"
             response = chat_model.invoke(
-                web_prompt(web_search(query), query, style)
+                web_prompt(web_search(raw_query), raw_query, style)
             ).content
 
-        return response, source
+        return response, source, retrieved_context
 
     except Exception as e:
-        return f"Error: {str(e)}", None
+        return f"Error: {str(e)}", None, ""
 
 
 def source_badge(source):
     if source == "rag":
         detail = st.session_state.get("last_source_detail", "")
-        label = f"✅ Source: {detail}" if detail else "✅ Source: Uploaded Documents"
+        score = st.session_state.get("last_score", 0)
+        relevance = min(int(score * 100), 100)
+        label = (
+            f"✅ Source: {detail} — Relevance: {relevance}%"
+            if detail
+            else "✅ Source: Uploaded Documents"
+        )
         st.markdown(
             f'<span style="background:#d1fae5;color:#065f46;padding:2px 10px;border-radius:10px;font-size:12px;">{label}</span>',
             unsafe_allow_html=True,
@@ -147,7 +166,7 @@ def chat_page():
 
     mode = st.radio("Response Mode", ["Concise", "Detailed"], horizontal=True)
 
-    for key in ["indexed", "messages", "sources"]:
+    for key in ["indexed", "messages", "sources", "contexts"]:
         if key not in st.session_state:
             st.session_state[key] = False if key == "indexed" else []
 
@@ -194,6 +213,13 @@ def chat_page():
                 idx = i // 2
                 if idx < len(st.session_state.sources):
                     source_badge(st.session_state.sources[idx])
+                    if (
+                        st.session_state.sources[idx] == "rag"
+                        and idx < len(st.session_state.contexts)
+                        and st.session_state.contexts[idx]
+                    ):
+                        with st.expander("📄 View retrieved context"):
+                            st.markdown(st.session_state.contexts[idx])
 
     if prompt := st.chat_input("Ask a clinical question..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
@@ -202,12 +228,16 @@ def chat_page():
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                reply, source = get_response(st.session_state.messages, mode)
+                reply, source, context = get_response(st.session_state.messages, mode)
             st.markdown(reply)
             source_badge(source)
+            if source == "rag" and context:
+                with st.expander("📄 View retrieved context"):
+                    st.markdown(context)
 
         st.session_state.messages.append({"role": "assistant", "content": reply})
         st.session_state.sources.append(source)
+        st.session_state.contexts.append(context)
 
 
 def instructions_page():
@@ -250,10 +280,36 @@ def main():
         st.divider()
         page = st.radio("Navigate", ["Chat", "Setup Guide"])
         st.divider()
+
+        if st.session_state.get("indexed"):
+            faiss_docs = st.session_state.get("faiss_docs", [])
+            unique_files = len(set(d["file"] for d in faiss_docs))
+            total_chunks = len(faiss_docs)
+            col1, col2 = st.columns(2)
+            col1.metric("Documents", unique_files)
+            col2.metric("Chunks", total_chunks)
+            st.divider()
+
+        if st.session_state.get("messages"):
+            chat_text = "\n\n".join(
+                [
+                    f"{m['role'].upper()}: {m['content']}"
+                    for m in st.session_state.messages
+                ]
+            )
+            st.download_button(
+                "📥 Download Chat",
+                chat_text,
+                file_name="medchat_history.txt",
+                use_container_width=True,
+            )
+            st.divider()
+
         if st.button("🗑️ Clear Chat", use_container_width=True):
             st.session_state.messages = []
             st.session_state.indexed = False
             st.session_state.sources = []
+            st.session_state.contexts = []
             st.session_state.pop("faiss_index", None)
             st.session_state.pop("faiss_docs", None)
             st.rerun()
